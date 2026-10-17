@@ -1,0 +1,12 @@
+bin/
+obj/
+*.user
+node_modules/
+dist/
+app/src-tauri/target/
+app/src-tauri/binaries/
+app/test-results/
+app/playwright-report/
+__pycache__/
+*.pst
+.build/

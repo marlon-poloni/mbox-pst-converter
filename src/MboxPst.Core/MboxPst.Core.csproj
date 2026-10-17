@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>MboxPst.Core</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="MimeKit" Version="4.17.0" />
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.11" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Mail2Pst.Core/Mail2Pst.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="MboxPst.Core.Tests" />
+    <InternalsVisibleTo Include="MboxPst.Integration.Tests" />
+    <InternalsVisibleTo Include="mboxpst-core" />
+  </ItemGroup>
+</Project>

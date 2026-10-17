@@ -1,0 +1,20 @@
+From trap1@example.com Mon Jan 01 00:00:00 2024
+From: "Trap Sender" <sender@example.com>
+To: recipient@example.com
+Subject: pakke
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+This message body holds trap lines a naive mbox parser could misread.
+From here on, everything is fine - this starts with "From " but is body text.
+--not-a-real-boundary
+>From escaped: originally a "From " body line under mboxrd.
+End of the first message body.
+
+From trap2@example.com Mon Jan 01 00:00:01 2024
+From: second@example.com
+To: recipient@example.com
+Subject: second message
+Content-Type: text/plain; charset=utf-8
+
+This is the second message body. It must not be swallowed into the first.

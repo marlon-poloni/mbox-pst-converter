@@ -1,0 +1,425 @@
+// SPDX-FileCopyrightText: 2026 Aksel Visby (ContinuMail)
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#nullable enable
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
+using Mail2Pst.Core;
+using Mail2Pst.Core.Config;
+using Mail2Pst.Core.Models;
+using Mail2Pst.Core.OutlookCategories;
+using PSTFileFormat;
+
+namespace Mail2Pst.Core.Writing;
+
+/// <summary>One folder to pre-create, with the leaf container class it must carry.</summary>
+internal readonly record struct FolderToPrecreate(IReadOnlyList<string> Path, FolderItemTypeName Type);
+
+/// <summary>
+/// Owns the output-PST part lifecycle for a single WritePlan call: the current PSTFile
+/// handle, part numbering, rename-on-first-split, the per-part folder cache, the per-part
+/// size estimate/counters, and the predictive + checkpoint splits. Behaviour is a 1:1
+/// extraction of logic previously inline in PstWriter.WritePlan. The write itself is
+/// supplied as a delegate so this class never depends on PstWriter and PSTFile stays
+/// encapsulated.
+/// </summary>
+internal sealed class PstPartManager
+{
+    private readonly string _groupName;
+    private readonly string _outputDirectory;
+    private readonly long _maxSizeBytes;
+    private readonly int _checkIntervalMessages;
+    private readonly Action<PSTFile, PSTFolder, MailMessage> _writeMessage;
+    private readonly long _emptyStoreSize;
+    private readonly byte[]? _categoryListFaiXml;   // baked into each part's Calendar folder; null = skip
+    private readonly string _storeDisplayName;
+    private readonly string _deletedItemsDisplayName;
+
+    private readonly List<string> _outputFiles = new();
+    private readonly Dictionary<string, PSTFolder> _folders = new();
+    private readonly HashSet<PSTFolder> _dirtyFolders = new(ReferenceEqualityComparer.Instance);
+    private PSTFile? _file;
+    private string _currentPath = "";
+    private int _partNumber = 1;
+    private long _estimatedContentBytes;   // per-part; reset on split
+    private int _messagesInCurrentPart;
+    private int _messagesSinceCheck;
+
+    public PstPartManager(string groupName, string outputDirectory,
+        long maxSizeBytes, int checkIntervalMessages,
+        Action<PSTFile, PSTFolder, MailMessage> writeMessage,
+        byte[]? categoryListFaiXml = null,
+        string? storeDisplayName = null,
+        string deletedItemsDisplayName = "Deleted Items")
+    {
+        _storeDisplayName = storeDisplayName ?? groupName;
+        _deletedItemsDisplayName = deletedItemsDisplayName;
+        _groupName = groupName;
+        _outputDirectory = outputDirectory;
+        _maxSizeBytes = maxSizeBytes;
+        _checkIntervalMessages = checkIntervalMessages;
+        _writeMessage = writeMessage;
+        _categoryListFaiXml = categoryListFaiXml;
+        // From-scratch creation (PSTFile.CreateEmptyStore) seeds every part; the template
+        // copy is retired. The initial on-disk size is the constant empty-store size.
+        _emptyStoreSize = PSTFile.EmptyStoreSizeBytes;
+    }
+
+    public IReadOnlyList<string> OutputFiles => _outputFiles;
+    public string CurrentPath => _currentPath;
+    public bool CheckpointDue => _messagesSinceCheck >= _checkIntervalMessages;
+
+    /// <summary>
+    /// Opens the first (un-suffixed) part, begins saving, and pre-creates the given folders with their
+    /// correct leaf item types (the IncludeEmptyFolders set + every contact/calendar/task target folder,
+    /// so an empty source still appears as an empty typed folder). Call exactly once, before the loop.
+    /// Validates the inventory FIRST, so a bad request throws before any PST file is created on disk.
+    /// </summary>
+    public void Begin(IReadOnlyList<FolderToPrecreate> foldersToPrecreate)
+    {
+        ValidateFolderInventory(foldersToPrecreate);   // fail before touching the filesystem
+        EnsureOutputDoesNotExist();                    // fail before overwriting a pre-existing output PST
+
+        _currentPath = StartNewFile(_groupName, null, _outputDirectory);
+        _outputFiles.Add(_currentPath);
+        // Outlook2007RTM is load-bearing: it matches the compatibility mode CreateEmptyStore writes
+        // (fAMapValid=VALID_AMAP2) and that the independent reader + Outlook validate against. A
+        // mismatch here corrupts the AMap marker; the IndependentValidationTests gate would catch it.
+        _file = new PSTFile(_currentPath, FileAccess.ReadWrite, WriterCompatibilityMode.Outlook2007RTM);
+        _file.BeginSavingChanges();
+        foreach (FolderToPrecreate folder in foldersToPrecreate)
+            GetOrCreateFolder(folder.Path, folder.Type);   // GuardLeafClass is the second line of defense
+        StampCategoryFai();
+    }
+
+    // Stamp the CategoryList FAI into this part's Calendar folder (creating an empty IPF.Appointment
+    // "Calendar" folder if the store has none — a mail-only store). No-op when there is no colour plan.
+    // Called once per part, right after the part is opened and BeginSavingChanges is active.
+    private void StampCategoryFai()
+    {
+        if (_categoryListFaiXml is null || _categoryListFaiXml.Length == 0) return;
+        PSTFolder calendar = EnsureCalendarFolder();
+        CategoryListFaiWriter.Stamp(_file!, calendar, _categoryListFaiXml);
+    }
+
+    // Ensure a dedicated TOP-LEVEL "Calendar" (IPF.Appointment) folder to host the FAI, matching the
+    // EXACT placement the render kill-gate proved (top-level "Calendar"). We do NOT stamp into the
+    // appointment EVENT folders: those default to the nested path ["Calendars", CalId] (MappingEngine),
+    // so the IPF.Appointment event folder is a grandchild of the root, and whether Outlook reads the
+    // master list from a nested (non-top-level) calendar folder is UNPROVEN. So a store with appointments
+    // may contain both its "Calendars/<id>" event tree and this "Calendar" FAI host — accepted (same as
+    // the empty-Calendar-for-mail-only case). Reuse the top-level "Calendar" if it already exists (e.g. a
+    // config whose appointment folder is a single top-level "Calendar" segment, or a prior stamp on this
+    // part), else create it.
+    // Edge case (rare, accepted): if a mail conversion legitimately produced its own top-level
+    // "Calendar" folder (IPF.Note, e.g. mirrored from a source folder literally named "Calendar"),
+    // the class check below falls through and creates a second, separate "Calendar" sibling
+    // (IPF.Appointment) to host the FAI — two top-level folders sharing a display name but
+    // distinguished by container class. Outlook tolerates this; we do not attempt to rename or merge.
+    private PSTFolder EnsureCalendarFolder()
+    {
+        PSTFolder top = _file!.TopOfPersonalFolders;
+        PSTFolder? existing = top.FindChildFolder("Calendar");
+        if (existing is not null &&
+            string.Equals(existing.ContainerClass,
+                PSTFolder.GetContainerClass(FolderItemTypeName.Appointment), StringComparison.Ordinal))
+            return existing;
+        return top.CreateChildFolder("Calendar", FolderItemTypeName.Appointment);
+    }
+
+    // Pre-flight: reject an empty path or the same path requested as two different item types BEFORE any
+    // file is created, so a bad inventory never leaves a partial PST on disk.
+    private static void ValidateFolderInventory(IReadOnlyList<FolderToPrecreate> folders)
+    {
+        var seen = new Dictionary<string, FolderItemTypeName>(StringComparer.Ordinal);
+        foreach (FolderToPrecreate folder in folders)
+        {
+            if (folder.Path is null || folder.Path.Count == 0)
+                throw new ConfigValidationException("Folder path cannot be empty.");
+            string key = FolderPathKey.Join(folder.Path);
+            if (seen.TryGetValue(key, out FolderItemTypeName existing) && existing != folder.Type)
+                throw new ConfigValidationException(
+                    $"Folder '{string.Join("/", folder.Path)}' is requested as both {existing} and {folder.Type}.");
+            seen[key] = folder.Type;
+        }
+    }
+
+    /// <summary>Fail-fast guard: refuse to overwrite a pre-existing output PST. <see cref="Begin"/>
+    /// creates the first part with <c>PSTFile.CreateEmptyStore</c> (which truncates via
+    /// <c>FileMode.Create</c>), and a later cancel/fatal deletes the current part — so silently
+    /// overwriting a prior good PST would destroy it on an aborted re-run. We refuse instead, before
+    /// any file is created. Throws before <see cref="StartNewFile"/>, so <c>_currentPath</c> stays
+    /// empty and the fatal-cleanup <see cref="DeleteCurrentPart"/> is a no-op.
+    /// Checks the single-file name (<c>Name.pst</c>) and — because a prior run may have split into
+    /// <c>Name-1.pst</c>, <c>Name-2.pst</c>, … and we cannot know up front how many parts this run
+    /// makes — any converter-owned split part by pattern.</summary>
+    private void EnsureOutputDoesNotExist()
+    {
+        string singlePath = ResolveOutputPath(_groupName, partNumber: null, _outputDirectory);
+        if (File.Exists(singlePath))
+            throw new ConfigValidationException(
+                $"Output file '{singlePath}' already exists. Remove it or choose a different output " +
+                "directory, then run the conversion again.");
+
+        string dir = Path.GetDirectoryName(singlePath)!;   // = the resolved full output directory
+        string? existingPart = FindExistingSplitPart(dir, _groupName);
+        if (existingPart is not null)
+            throw new ConfigValidationException(
+                $"An output file from a previous run ('{existingPart}') already exists. Remove it or " +
+                "choose a different output directory, then run the conversion again.");
+    }
+
+    /// <summary>Returns the path of the first existing converter-owned split part
+    /// (<c>Name-1.pst</c>, <c>Name-2.pst</c>, …) in <paramref name="dir"/>, or <c>null</c>. Matches
+    /// the exact split-naming pattern (a positive integer with no leading zero — parts are numbered
+    /// from 1), so unrelated files such as <c>Name-old.pst</c> or <c>Name-0.pst</c> are ignored.
+    /// Case-insensitive on Windows, case-sensitive elsewhere (filesystem semantics).</summary>
+    private static string? FindExistingSplitPart(string dir, string groupName)
+    {
+        if (!Directory.Exists(dir))
+            return null;
+        RegexOptions options = OperatingSystem.IsWindows() ? RegexOptions.IgnoreCase : RegexOptions.None;
+        var partPattern = new Regex($"^{Regex.Escape(groupName)}-[1-9][0-9]*\\.pst$", options);
+        foreach (string path in Directory.EnumerateFiles(dir, "*.pst"))
+            if (partPattern.IsMatch(Path.GetFileName(path)))
+                return path;
+        return null;
+    }
+
+    public bool ShouldSplitBefore(long messageSize) =>
+        _messagesInCurrentPart > 0 &&
+        _emptyStoreSize + _estimatedContentBytes + messageSize >= _maxSizeBytes;
+
+    /// <summary>Predictive split: flushes the current part, then starts the next.</summary>
+    public void FlushAndSplit()
+    {
+        SaveDirtyFolders();
+        _file!.EndSavingChanges();
+        StartNextPartAfterFlush();
+    }
+
+    public void Write(IReadOnlyList<string> path, MailMessage message)
+    {
+        PSTFolder folder = GetOrCreateFolder(path, FolderItemTypeName.Note);
+        _writeMessage(_file!, folder, message);
+        _dirtyFolders.Add(folder);
+    }
+
+    public void OnWritten(long messageSize)
+    {
+        _estimatedContentBytes += messageSize;
+        _messagesInCurrentPart++;
+        _messagesSinceCheck++;
+    }
+
+    // Flush every folder that received a message since the last save. The vendored library
+    // requires folder.SaveChanges() before file.EndSavingChanges() or the contents-table
+    // update is lost — batching the per-folder save to each flush boundary (instead of per
+    // message) avoids rewriting a folder's whole contents table on every single message.
+    // An empty dirty set is a no-op (empty PSTs, pre-created-only folders, finish-with-no-writes).
+    private void SaveDirtyFolders()
+    {
+        foreach (PSTFolder folder in _dirtyFolders)
+            folder.SaveChanges();
+        _dirtyFolders.Clear();
+    }
+
+    /// <summary>Saves dirty folders, then EndSavingChanges — the checkpoint path flushes here so progress can emit before the size decision.</summary>
+    public void Flush()
+    {
+        SaveDirtyFolders();
+        _file!.EndSavingChanges();
+    }
+
+    /// <summary>
+    /// PRECONDITION: Flush() was just called. Splits if the part reached the cap (returns
+    /// true), else resumes saving (returns false). POSTCONDITION (both branches): the part
+    /// is in an active BeginSavingChanges state, ready for more writes or Finish().
+    /// </summary>
+    public bool TrySplitOrResumeAfterFlush()
+    {
+        long size = Math.Max(_file!.BaseStream.Length, _emptyStoreSize + _estimatedContentBytes);
+        if (size >= _maxSizeBytes)
+        {
+            StartNextPartAfterFlush();   // opens the next part with BeginSavingChanges active
+            return true;
+        }
+        _messagesSinceCheck = 0;
+        _file.BeginSavingChanges();
+        return false;
+    }
+
+    public void Finish()
+    {
+        SaveDirtyFolders();
+        _file!.EndSavingChanges();
+    }
+
+    /// <summary>Closes the current handle. Idempotent: nulls the field so a double Close() is a no-op.</summary>
+    public void Close()
+    {
+        _file?.CloseFile();
+        _file = null;
+    }
+
+    public void DeleteCurrentPart() => TryDeletePart(_currentPath);
+
+    /// <summary>Measurement-only [§7]: aggregate this part's durable-memory residency from live state.</summary>
+    internal Mail2Pst.Core.Diagnostics.DurableMemoryReport SnapshotDurableMemory(int messagesWritten)
+    {
+        if (_file is null) return new Mail2Pst.Core.Diagnostics.DurableMemoryReport(
+            System.Array.Empty<Mail2Pst.Core.Diagnostics.FamilyResidency>(), 0, messagesWritten);
+        return Mail2Pst.Core.Diagnostics.DurableMemoryCollector.Collect(_file, _folders.Values, messagesWritten);
+    }
+
+    // Closes the current (already-flushed) part and opens the next. PRECONDITION: the
+    // caller has just flushed (EndSavingChanges). Once the old part is closed it is COMPLETE,
+    // so _currentPath is cleared until the next part opens: if creating the next part throws,
+    // the fatal-cleanup DeleteCurrentPart() must delete neither the completed part nor a
+    // half-made next part (the orphan template copy is removed here). Builds the next part
+    // fully into LOCALS before mutating shared state, so a StartNewFile/PSTFile failure leaves
+    // the last-good part intact rather than half-initialised.
+    private void StartNextPartAfterFlush()
+    {
+        _file!.CloseFile();
+        _file = null;
+
+        // The just-closed part is complete. There is no in-progress part until the next one
+        // opens; clear _currentPath so an abort mid-split targets nothing (see DeleteCurrentPart).
+        string completedPath = _currentPath;
+        _currentPath = "";
+
+        if (_partNumber == 1)
+        {
+            // First split: the initial "Name.pst" becomes part 1.
+            string part1 = ResolveOutputPath(_groupName, 1, _outputDirectory);
+            try
+            {
+                TransientFileRetry.Run(() => File.Move(completedPath, part1, overwrite: true));
+            }
+            catch (IOException ex)
+            {
+                // Any IOException that escapes the retry helper — a transient violation whose
+                // retries were exhausted, or a non-transient one surfaced immediately — gets a
+                // clear, attributable message instead of a bare File.Move failure. The initial
+                // part still exists under its original name (the move failed) and is kept.
+                throw new IOException(
+                    $"Failed to rename '{completedPath}' to '{part1}' while starting split part 2.", ex);
+            }
+            _outputFiles[0] = part1;
+        }
+
+        int nextPartNumber = _partNumber + 1;
+        string nextPath = "";
+        PSTFile? nextFile = null;
+        bool opened = false;
+        try
+        {
+            nextPath = StartNewFile(_groupName, nextPartNumber, _outputDirectory);
+            // same Outlook2007RTM contract as Begin()
+            nextFile = new PSTFile(nextPath, FileAccess.ReadWrite, WriterCompatibilityMode.Outlook2007RTM);
+            nextFile.BeginSavingChanges();
+
+            // New part open and ready — only now mutate shared state.
+            _partNumber = nextPartNumber;
+            _currentPath = nextPath;
+            _outputFiles.Add(nextPath);
+            _file = nextFile;
+            _folders.Clear();
+            _dirtyFolders.Clear();
+            _estimatedContentBytes = 0;
+            _messagesSinceCheck = 0;
+            _messagesInCurrentPart = 0;
+            opened = true;
+            StampCategoryFai();   // stamp the new part's Calendar folder
+        }
+        finally
+        {
+            if (!opened)
+            {
+                // The split failed after the previous part was completed. Close the orphan
+                // handle and delete the orphan template copy (if StartNewFile got that far) so
+                // a failed split leaves no stray blank part. _currentPath stays "" so the
+                // completed parts already on disk are preserved by the caller's fatal cleanup.
+                nextFile?.CloseFile();
+                if (nextPath.Length > 0) TryDeletePart(nextPath);
+            }
+        }
+    }
+
+    private string StartNewFile(string groupName, int? partNumber, string outputDirectory)
+    {
+        string fullPath = ResolveOutputPath(groupName, partNumber, outputDirectory);
+        TransientFileRetry.Run(() => PSTFile.CreateEmptyStore(fullPath, _storeDisplayName, _deletedItemsDisplayName));
+        return fullPath;
+    }
+
+    private static string ResolveOutputPath(string groupName, int? partNumber, string outputDirectory)
+    {
+        OutputNameValidator.Validate(groupName);
+        string fileName = partNumber is null ? $"{groupName}.pst" : $"{groupName}-{partNumber}.pst";
+        string fullDir = Path.GetFullPath(outputDirectory);
+        string fullPath = Path.GetFullPath(Path.Combine(fullDir, fileName));
+        string relative = Path.GetRelativePath(fullDir, fullPath);
+        if (relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative))
+            throw new ConfigValidationException($"Resolved output path escapes the output directory: {fullPath}");
+        return fullPath;
+    }
+
+    private PSTFolder GetOrCreateFolder(IReadOnlyList<string> path, FolderItemTypeName itemType)
+    {
+        if (path.Count == 0)
+            throw new InvalidOperationException("GetOrCreateFolder requires a non-empty path.");
+
+        PSTFolder current = _file!.TopOfPersonalFolders;
+        var prefix = new List<string>(path.Count);
+        for (int i = 0; i < path.Count; i++)
+        {
+            string segment = path[i];
+            prefix.Add(segment);
+            string key = FolderPathKey.Join(prefix);
+            bool isLeaf = i == path.Count - 1;
+            // Leaf carries the requested item type; parents are containers (Note default is fine).
+            FolderItemTypeName segType = isLeaf ? itemType : FolderItemTypeName.Note;
+
+            if (_folders.TryGetValue(key, out PSTFolder? cached))
+            {
+                GuardLeafClass(isLeaf, segType, cached, key);
+                current = cached; continue;
+            }
+            PSTFolder? existing = current.FindChildFolder(segment);
+            if (existing != null) GuardLeafClass(isLeaf, segType, existing, key);
+            current = existing ?? current.CreateChildFolder(segment, segType);
+            _folders[key] = current; // cache EVERY level, not just the leaf
+        }
+        return current;
+    }
+
+    // Two-way guard: a reused leaf's container class must match the requested item type
+    // (mail asks for IPF.Note, contacts for IPF.Contact). Non-leaf segments are containers
+    // and are not type-checked.
+    //
+    // Exception: a store-seeded special folder (e.g. "Deleted Items") carries an EMPTY
+    // PidTagContainerClass — every writer-CREATED folder always gets a real IPF class, so an
+    // empty/unset class uniquely marks an untyped seeded special. These are adoptable as any
+    // item type (a source folder named "Deleted Items" then lands its mail in the store's
+    // Deleted Items — the correct fidelity outcome), so reuse them rather than fail the run.
+    private static void GuardLeafClass(bool isLeaf, FolderItemTypeName segType, PSTFolder folder, string key)
+    {
+        if (!isLeaf) return;
+        if (string.IsNullOrEmpty(folder.ContainerClass)) return;   // untyped seeded special — adoptable
+        string expected = PSTFolder.GetContainerClass(segType);   // e.g. "IPF.Contact" / "IPF.Note"
+        if (!string.Equals(folder.ContainerClass, expected, StringComparison.Ordinal))
+            throw new ConfigValidationException(
+                $"Folder '{key}' already exists as '{folder.ContainerClass}'; cannot reuse it as '{expected}'.");
+    }
+
+    private static void TryDeletePart(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+}

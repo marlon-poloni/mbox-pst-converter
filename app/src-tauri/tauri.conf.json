@@ -1,0 +1,71 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Conversor de e-mails",
+  "version": "0.1.0",
+  "identifier": "br.com.consultoriadevcore.conversoremails",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Conversor de e-mails",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 1024,
+        "minHeight": 680,
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "deb",
+      "nsis"
+    ],
+    "category": "Utility",
+    "shortDescription": "Converte e-mails do Gmail (mbox) em PST para o Outlook",
+    "longDescription": "Converte exports mbox do Google Takeout em arquivos PST, transformando cada marcador do Gmail em pasta do Outlook. Funciona sem internet.",
+    "license": "GPL-3.0-or-later",
+    "externalBin": [
+      "binaries/mboxpst-core"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "linux": {
+      "deb": {
+        "depends": [
+          "libicu78 | libicu77 | libicu76 | libicu74 | libicu72 | libicu70 | libicu67"
+        ]
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "PortugueseBR"
+        ]
+      }
+    },
+    "licenseFile": "../../LICENSE",
+    "resources": {
+      "../../LICENSE": "licencas/LICENSE.txt",
+      "../../NOTICE": "licencas/NOTICE.txt",
+      "../../vendor/LICENSE-PSTFileFormat.txt": "licencas/LGPL-PSTFileFormat.txt",
+      "../src/fonts/OFL.txt": "licencas/OFL-fontes.txt"
+    }
+  }
+}
