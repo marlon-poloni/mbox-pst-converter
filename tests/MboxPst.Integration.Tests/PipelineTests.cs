@@ -22,7 +22,8 @@ public sealed class PipelineTests : IDisposable
             File.SetAttributes(f, FileAttributes.Normal);
         if (Directory.Exists(_out))
         {
-            new DirectoryInfo(_out).UnixFileMode |= UnixFileMode.UserWrite;
+            if (!OperatingSystem.IsWindows())
+                new DirectoryInfo(_out).UnixFileMode |= UnixFileMode.UserWrite;
             Directory.Delete(_out, true);
         }
     }
@@ -210,7 +211,7 @@ public sealed class PipelineTests : IDisposable
         Assert.Equal(tempBefore, string.Join("|", Directory.GetFiles(Path.GetTempPath(), "mail2pst-*")));
     }
 
-    [Fact]
+    [SkippableFact]
     public void Saida_sem_permissao_gera_erro_claro()
     {
         Skip.If(OperatingSystem.IsWindows());
